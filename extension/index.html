@@ -11,7 +11,7 @@
 
   <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body data-theme="light">
 <div class="container">
 
 
@@ -25,6 +25,28 @@
       <h1 id="greeting"></h1>
       <!-- "Friday, April 4, 2026" — written by getDateDisplay() in app.js -->
       <div class="date" id="dateDisplay"></div>
+    </div>
+    <div class="header-right">
+      <div class="theme-toggle" role="group" aria-label="Theme toggle">
+        <button
+          type="button"
+          class="theme-toggle-btn active"
+          data-action="set-theme"
+          data-theme-choice="light"
+          aria-pressed="true"
+        >
+          Light
+        </button>
+        <button
+          type="button"
+          class="theme-toggle-btn"
+          data-action="set-theme"
+          data-theme-choice="dark"
+          aria-pressed="false"
+        >
+          Dark
+        </button>
+      </div>
     </div>
   </header>
 
@@ -45,6 +67,15 @@
     </div>
     <button class="tab-cleanup-btn" data-action="close-tabout-dupes">Close extras</button>
   </div>
+
+  <section class="favorites-section">
+    <div class="section-header">
+      <h2>Favorites</h2>
+      <div class="section-line"></div>
+      <div class="section-count" id="favoritesCount"></div>
+    </div>
+    <div class="favorites-grid" id="favoritesGrid"></div>
+  </section>
 
   <!-- ================================================================
        MAIN CONTENT AREA — two-column layout
@@ -123,6 +154,30 @@
     <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
   </svg>
   <span id="toastText"></span>
+</div>
+
+<div class="favorite-modal-backdrop" id="favoriteModalBackdrop" style="display:none">
+  <div class="favorite-modal">
+    <div class="favorite-modal-header">
+      <h3 id="favoriteModalTitle">Add favorite</h3>
+      <button type="button" class="favorite-modal-close" data-action="close-favorite-modal" aria-label="Close">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.2" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
+        </svg>
+      </button>
+    </div>
+    <form class="favorite-form" id="favoriteForm">
+      <input type="hidden" id="favoriteFormId">
+      <label class="favorite-form-label" for="favoriteFormName">Name</label>
+      <input type="text" id="favoriteFormName" class="favorite-form-input" maxlength="80" placeholder="GitHub">
+      <label class="favorite-form-label" for="favoriteFormUrl">URL</label>
+      <input type="text" id="favoriteFormUrl" class="favorite-form-input" placeholder="https://github.com" inputmode="url" autocapitalize="off" spellcheck="false">
+      <div class="favorite-form-actions">
+        <button type="button" class="action-btn" data-action="close-favorite-modal">Cancel</button>
+        <button type="submit" class="action-btn primary">Save favorite</button>
+      </div>
+    </form>
+  </div>
 </div>
 
 <!-- Personal config (gitignored) — defines LOCAL_LANDING_PAGE_PATTERNS etc. -->

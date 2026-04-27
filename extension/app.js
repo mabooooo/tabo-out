@@ -15,6 +15,299 @@
 
 'use strict';
 
+const THEME_STORAGE_KEY = 'themePreference';
+const FAVORITES_STORAGE_KEY = 'favorites';
+const THEME_LIGHT = 'light';
+const THEME_DARK = 'dark';
+let currentTheme = THEME_LIGHT;
+let favoriteModalMode = 'add';
+
+/**
+ * isValidTheme(theme)
+ *
+ * 中文注释：只允许 light / dark 两种主题值，避免脏数据污染 UI。
+ */
+function isValidTheme(theme) {
+  return theme === THEME_LIGHT || theme === THEME_DARK;
+}
+
+/**
+ * syncThemeToggleUI()
+ *
+ * 中文注释：同步右上角按钮的激活态和无障碍属性。
+ */
+function syncThemeToggleUI() {
+  document.querySelectorAll('[data-theme-choice]').forEach((button) => {
+    const isActive = button.dataset.themeChoice === currentTheme;
+    button.classList.toggle('active', isActive);
+    button.setAttribute('aria-pressed', String(isActive));
+  });
+}
+
+/**
+ * applyTheme(theme)
+ *
+ * 中文注释：统一修改页面主题，避免 DOM 状态和内存状态不一致。
+ */
+function applyTheme(theme) {
+  currentTheme = isValidTheme(theme) ? theme : THEME_LIGHT;
+  document.body.dataset.theme = currentTheme;
+  syncThemeToggleUI();
+}
+
+/**
+ * loadThemePreference()
+ *
+ * 中文注释：页面初始化时优先读取用户保存的主题，没有则回退到 light。
+ */
+async function loadThemePreference() {
+  try {
+    const stored = await chrome.storage.local.get(THEME_STORAGE_KEY);
+    applyTheme(stored[THEME_STORAGE_KEY]);
+  } catch (err) {
+    console.warn('[tab-out] Failed to load theme preference:', err);
+    applyTheme(THEME_LIGHT);
+  }
+}
+
+/**
+ * persistThemePreference(theme)
+ *
+ * 中文注释：先切换界面，再异步落盘，保证点击反馈足够直接。
+ */
+async function persistThemePreference(theme) {
+  applyTheme(theme);
+
+  try {
+    await chrome.storage.local.set({ [THEME_STORAGE_KEY]: currentTheme });
+  } catch (err) {
+    console.warn('[tab-out] Failed to save theme preference:', err);
+  }
+}
+
+/**
+ * escapeHtml(value)
+ *
+ * 中文注释：渲染 HTML 字符串前统一转义，避免标题或 URL 破坏结构。
+ */
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * normalizeFavoriteUrl(rawUrl)
+ *
+ * 中文注释：手动新增/编辑收藏时兜底补全协议，并过滤无效 URL。
+ */
+function normalizeFavoriteUrl(rawUrl) {
+  const input = String(rawUrl || '').trim();
+  if (!input) throw new Error('URL is required');
+
+  const withProtocol = /^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(input) ? input : `https://${input}`;
+  const parsed = new URL(withProtocol);
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('Only http/https URLs are supported');
+  }
+
+  return parsed.toString();
+}
+
+function getHostname(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function buildFallbackFaviconUrl(url) {
+  const hostname = getHostname(url);
+  return hostname ? `https://www.google.com/s2/favicons?domain=${hostname}&sz=64` : '';
+}
+
+function getFavoriteDisplayName(favorite) {
+  return (favorite.name || getHostname(favorite.url) || favorite.url || 'Favorite').trim();
+}
+
+function getFavoriteFaviconUrl(favorite) {
+  return favorite.faviconUrl || buildFallbackFaviconUrl(favorite.url);
+}
+
+async function getFavorites() {
+  const { favorites = [] } = await chrome.storage.local.get(FAVORITES_STORAGE_KEY);
+  return Array.isArray(favorites) ? favorites : [];
+}
+
+async function saveFavorites(favorites) {
+  await chrome.storage.local.set({ [FAVORITES_STORAGE_KEY]: favorites });
+}
+
+function createFavoriteRecord({ id, url, name, faviconUrl, createdAt }) {
+  const normalizedUrl = normalizeFavoriteUrl(url);
+  const cleanName = String(name || '').trim() || getHostname(normalizedUrl) || normalizedUrl;
+  const now = new Date().toISOString();
+
+  return {
+    id: id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    url: normalizedUrl,
+    name: cleanName,
+    faviconUrl: faviconUrl || buildFallbackFaviconUrl(normalizedUrl),
+    createdAt: createdAt || now,
+    updatedAt: now,
+  };
+}
+
+/**
+ * upsertFavorite(input)
+ *
+ * 中文注释：收藏的新增和编辑都走这一层，保证数据结构统一、可持久化。
+ */
+async function upsertFavorite(input) {
+  const favorites = await getFavorites();
+  const record = createFavoriteRecord(input);
+  const existingIndex = favorites.findIndex((item) => item.id === record.id);
+
+  if (existingIndex >= 0) {
+    favorites[existingIndex] = {
+      ...favorites[existingIndex],
+      ...record,
+      createdAt: favorites[existingIndex].createdAt || record.createdAt,
+    };
+  } else {
+    const sameUrlIndex = favorites.findIndex((item) => item.url === record.url);
+    if (sameUrlIndex >= 0) {
+      favorites[sameUrlIndex] = {
+        ...favorites[sameUrlIndex],
+        ...record,
+        id: favorites[sameUrlIndex].id,
+        createdAt: favorites[sameUrlIndex].createdAt || record.createdAt,
+      };
+    } else {
+      favorites.push(record);
+    }
+  }
+
+  await saveFavorites(favorites);
+  return favorites.find((item) => item.id === record.id || item.url === record.url) || record;
+}
+
+async function removeFavorite(id) {
+  const favorites = await getFavorites();
+  await saveFavorites(favorites.filter((item) => item.id !== id));
+}
+
+async function saveFavoriteFromTab(tabData) {
+  return upsertFavorite({
+    url: tabData.url,
+    name: tabData.title,
+    faviconUrl: tabData.faviconUrl || buildFallbackFaviconUrl(tabData.url),
+  });
+}
+
+/**
+ * openOrFocusUrl(url)
+ *
+ * 中文注释：收藏点击时优先复用已打开的页面，找不到再新开标签页。
+ */
+async function openOrFocusUrl(url) {
+  if (!url) return;
+
+  const allTabs = await chrome.tabs.query({});
+  const exactMatch = allTabs.find((tab) => tab.url === url);
+  if (exactMatch) {
+    await chrome.tabs.update(exactMatch.id, { active: true });
+    await chrome.windows.update(exactMatch.windowId, { focused: true });
+    return;
+  }
+
+  await chrome.tabs.create({ url });
+}
+
+function renderFavoriteCard(favorite) {
+  const safeName = escapeHtml(getFavoriteDisplayName(favorite));
+  const faviconUrl = escapeHtml(getFavoriteFaviconUrl(favorite));
+  const editIcon = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a2.25 2.25 0 1 1 3.182 3.182L10.582 17.13a4.5 4.5 0 0 1-1.897 1.13L6 19l.74-2.685a4.5 4.5 0 0 1 1.13-1.897L16.862 4.487ZM19.5 7.125 16.875 4.5" /></svg>`;
+  const deleteIcon = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.1" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673A2.25 2.25 0 0 1 15.916 21.75H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.088-2.201a51.964 51.964 0 0 0-3.324 0C9.16 1.313 8.25 2.297 8.25 3.477v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" /></svg>`;
+
+  return `
+    <div class="favorite-card" data-favorite-id="${escapeHtml(favorite.id)}">
+      <button class="favorite-quick-actions" type="button" data-action="favorite-open" data-favorite-id="${escapeHtml(favorite.id)}" title="${safeName}">
+        <span class="favorite-icon-shell">
+          ${faviconUrl ? `<img class="favorite-icon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : '<span class="favorite-icon-fallback">+</span>'}
+        </span>
+        <span class="favorite-name">${safeName}</span>
+      </button>
+      <div class="favorite-card-actions">
+        <button class="favorite-card-action" type="button" data-action="favorite-edit" data-favorite-id="${escapeHtml(favorite.id)}" title="Edit favorite" aria-label="Edit favorite">${editIcon}</button>
+        <button class="favorite-card-action danger" type="button" data-action="favorite-delete" data-favorite-id="${escapeHtml(favorite.id)}" title="Delete favorite" aria-label="Delete favorite">${deleteIcon}</button>
+      </div>
+    </div>`;
+}
+
+function renderFavoriteAddCard() {
+  return `
+    <button type="button" class="favorite-card favorite-card-add" data-action="favorite-add" title="Add favorite">
+      <span class="favorite-icon-shell favorite-icon-shell-add">+</span>
+      <span class="favorite-name">Add</span>
+    </button>`;
+}
+
+/**
+ * renderFavoritesSection()
+ *
+ * 中文注释：收藏夹区域独立渲染，避免和 tab 分组渲染互相耦合。
+ */
+async function renderFavoritesSection() {
+  const grid = document.getElementById('favoritesGrid');
+  const countEl = document.getElementById('favoritesCount');
+  if (!grid || !countEl) return;
+
+  try {
+    const favorites = await getFavorites();
+    countEl.textContent = favorites.length > 0 ? `${favorites.length} item${favorites.length !== 1 ? 's' : ''}` : '';
+    grid.innerHTML = favorites.map(renderFavoriteCard).join('') + renderFavoriteAddCard();
+  } catch (err) {
+    console.warn('[tab-out] Failed to render favorites:', err);
+    countEl.textContent = '';
+    grid.innerHTML = renderFavoriteAddCard();
+  }
+}
+
+function openFavoriteModal(mode, favorite = null) {
+  const backdrop = document.getElementById('favoriteModalBackdrop');
+  const titleEl = document.getElementById('favoriteModalTitle');
+  const idInput = document.getElementById('favoriteFormId');
+  const nameInput = document.getElementById('favoriteFormName');
+  const urlInput = document.getElementById('favoriteFormUrl');
+  if (!backdrop || !titleEl || !idInput || !nameInput || !urlInput) return;
+
+  favoriteModalMode = mode;
+  titleEl.textContent = mode === 'edit' ? 'Edit favorite' : 'Add favorite';
+  idInput.value = favorite?.id || '';
+  nameInput.value = favorite?.name || '';
+  urlInput.value = favorite?.url || '';
+  backdrop.style.display = 'flex';
+  setTimeout(() => nameInput.focus(), 0);
+}
+
+function closeFavoriteModal() {
+  const backdrop = document.getElementById('favoriteModalBackdrop');
+  const form = document.getElementById('favoriteForm');
+  const idInput = document.getElementById('favoriteFormId');
+  if (!backdrop || !form || !idInput) return;
+
+  favoriteModalMode = 'add';
+  form.reset();
+  idInput.value = '';
+  backdrop.style.display = 'none';
+}
+
 
 /* ----------------------------------------------------------------
    CHROME TABS — Direct API Access
@@ -43,6 +336,7 @@ async function fetchOpenTabs() {
       id:       t.id,
       url:      t.url,
       title:    t.title,
+      favIconUrl: t.favIconUrl,
       windowId: t.windowId,
       active:   t.active,
       // Flag Tab Out's own pages so we can detect duplicate new tabs
@@ -700,6 +994,7 @@ const ICONS = {
   close:   `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>`,
   archive: `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M20.25 7.5l-.625 10.632a2.25 2.25 0 0 1-2.247 2.118H6.622a2.25 2.25 0 0 1-2.247-2.118L3.75 7.5m6 4.125l2.25 2.25m0 0l2.25 2.25M12 13.875l2.25-2.25M12 13.875l-2.25 2.25M3.375 7.5h17.25c.621 0 1.125-.504 1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125Z" /></svg>`,
   focus:   `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 19.5 15-15m0 0H8.25m11.25 0v11.25" /></svg>`,
+  star:    `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.9" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m11.48 3.499 2.012 4.078a1.5 1.5 0 0 0 1.129.82l4.5.654-3.256 3.174a1.5 1.5 0 0 0-.431 1.328l.769 4.48-4.025-2.116a1.5 1.5 0 0 0-1.396 0l-4.025 2.116.769-4.48a1.5 1.5 0 0 0-.431-1.328L4.88 9.051l4.5-.654a1.5 1.5 0 0 0 1.129-.82l2.012-4.078Z" /></svg>`,
 };
 
 
@@ -752,35 +1047,45 @@ function checkTabOutDupes() {
   }
 }
 
+function renderTabChip(tab, urlCounts = {}, domainHint = '') {
+  let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), domainHint);
+
+  try {
+    const parsed = new URL(tab.url);
+    if (parsed.hostname === 'localhost' && parsed.port) label = `${parsed.port} ${label}`;
+  } catch {}
+
+  const count = urlCounts[tab.url] || 1;
+  const dupeTag = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
+  const chipClass = count > 1 ? ' chip-has-dupes' : '';
+  const safeUrl = escapeHtml(tab.url || '');
+  const safeTitle = escapeHtml(label);
+  const faviconUrl = escapeHtml(tab.favIconUrl || buildFallbackFaviconUrl(tab.url));
+
+  return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
+    ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
+    <span class="chip-text">${safeTitle}</span>${dupeTag}
+    <div class="chip-actions">
+      <button class="chip-action chip-favorite" data-action="favorite-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" data-tab-favicon="${faviconUrl}" title="Add to favorites">
+        ${ICONS.star}
+      </button>
+      <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
+      </button>
+      <button class="chip-action chip-close" data-action="close-single-tab" data-tab-url="${safeUrl}" title="Close this tab">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+      </button>
+    </div>
+  </div>`;
+}
+
 
 /* ----------------------------------------------------------------
    OVERFLOW CHIPS ("+N more" expand button in domain cards)
    ---------------------------------------------------------------- */
 
 function buildOverflowChips(hiddenTabs, urlCounts = {}) {
-  const hiddenChips = hiddenTabs.map(tab => {
-    const label    = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), '');
-    const count    = urlCounts[tab.url] || 1;
-    const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
-    const chipClass = count > 1 ? ' chip-has-dupes' : '';
-    const safeUrl   = (tab.url || '').replace(/"/g, '&quot;');
-    const safeTitle = label.replace(/"/g, '&quot;');
-    let domain = '';
-    try { domain = new URL(tab.url).hostname; } catch {}
-    const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
-    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
-      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
-      <span class="chip-text">${label}</span>${dupeTag}
-      <div class="chip-actions">
-        <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
-        </button>
-        <button class="chip-action chip-close" data-action="close-single-tab" data-tab-url="${safeUrl}" title="Close this tab">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
-        </button>
-      </div>
-    </div>`;
-  }).join('');
+  const hiddenChips = hiddenTabs.map((tab) => renderTabChip(tab, urlCounts)).join('');
 
   return `
     <div class="page-chips-overflow" style="display:none">${hiddenChips}</div>
@@ -834,34 +1139,8 @@ function renderDomainCard(group) {
   const visibleTabs = uniqueTabs.slice(0, 8);
   const extraCount  = uniqueTabs.length - visibleTabs.length;
 
-  const pageChips = visibleTabs.map(tab => {
-    let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), group.domain);
-    // For localhost tabs, prepend port number so you can tell projects apart
-    try {
-      const parsed = new URL(tab.url);
-      if (parsed.hostname === 'localhost' && parsed.port) label = `${parsed.port} ${label}`;
-    } catch {}
-    const count    = urlCounts[tab.url];
-    const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
-    const chipClass = count > 1 ? ' chip-has-dupes' : '';
-    const safeUrl   = (tab.url || '').replace(/"/g, '&quot;');
-    const safeTitle = label.replace(/"/g, '&quot;');
-    let domain = '';
-    try { domain = new URL(tab.url).hostname; } catch {}
-    const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
-    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
-      ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
-      <span class="chip-text">${label}</span>${dupeTag}
-      <div class="chip-actions">
-        <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
-        </button>
-        <button class="chip-action chip-close" data-action="close-single-tab" data-tab-url="${safeUrl}" title="Close this tab">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
-        </button>
-      </div>
-    </div>`;
-  }).join('') + (extraCount > 0 ? buildOverflowChips(uniqueTabs.slice(8), urlCounts) : '');
+  const pageChips = visibleTabs.map((tab) => renderTabChip(tab, urlCounts, group.domain)).join('')
+    + (extraCount > 0 ? buildOverflowChips(uniqueTabs.slice(8), urlCounts) : '');
 
   let actionsHtml = `
     <button class="action-btn close-tabs" data-action="close-domain-tabs" data-domain-id="${stableId}">
@@ -1025,6 +1304,7 @@ async function renderStaticDashboard() {
   const dateEl     = document.getElementById('dateDisplay');
   if (greetingEl) greetingEl.textContent = getGreeting();
   if (dateEl)     dateEl.textContent     = getDateDisplay();
+  await renderFavoritesSection();
 
   // --- Fetch tabs ---
   await fetchOpenTabs();
@@ -1188,6 +1468,50 @@ document.addEventListener('click', async (e) => {
 
   const action = actionEl.dataset.action;
 
+  // 中文注释：主题切换独立处理，不和其他卡片操作共用后续逻辑。
+  if (action === 'set-theme') {
+    const theme = actionEl.dataset.themeChoice;
+    if (!isValidTheme(theme) || theme === currentTheme) return;
+    await persistThemePreference(theme);
+    return;
+  }
+
+  if (action === 'favorite-open') {
+    const favoriteId = actionEl.dataset.favoriteId;
+    const favorites = await getFavorites();
+    const favorite = favorites.find((item) => item.id === favoriteId);
+    if (!favorite) return;
+    await openOrFocusUrl(favorite.url);
+    return;
+  }
+
+  if (action === 'favorite-add') {
+    openFavoriteModal('add');
+    return;
+  }
+
+  if (action === 'favorite-edit') {
+    const favoriteId = actionEl.dataset.favoriteId;
+    const favorites = await getFavorites();
+    const favorite = favorites.find((item) => item.id === favoriteId);
+    if (!favorite) return;
+    openFavoriteModal('edit', favorite);
+    return;
+  }
+
+  if (action === 'favorite-delete') {
+    const favoriteId = actionEl.dataset.favoriteId;
+    await removeFavorite(favoriteId);
+    await renderFavoritesSection();
+    showToast('Favorite removed');
+    return;
+  }
+
+  if (action === 'close-favorite-modal') {
+    closeFavoriteModal();
+    return;
+  }
+
   // ---- Close duplicate Tab Out tabs ----
   if (action === 'close-tabout-dupes') {
     await closeTabOutDupes();
@@ -1297,6 +1621,24 @@ document.addEventListener('click', async (e) => {
 
     showToast('Saved for later');
     await renderDeferredColumn();
+    return;
+  }
+
+  if (action === 'favorite-single-tab') {
+    e.stopPropagation();
+    const tabUrl = actionEl.dataset.tabUrl;
+    const tabTitle = actionEl.dataset.tabTitle || tabUrl;
+    const tabFavicon = actionEl.dataset.tabFavicon || '';
+    if (!tabUrl) return;
+
+    await saveFavoriteFromTab({
+      url: tabUrl,
+      title: tabTitle,
+      faviconUrl: tabFavicon,
+    });
+
+    await renderFavoritesSection();
+    showToast('Added to favorites');
     return;
   }
 
@@ -1433,6 +1775,12 @@ document.addEventListener('click', async (e) => {
   }
 });
 
+document.addEventListener('click', (e) => {
+  if (e.target.id === 'favoriteModalBackdrop') {
+    closeFavoriteModal();
+  }
+});
+
 // ---- Archive toggle — expand/collapse the archive section ----
 document.addEventListener('click', (e) => {
   const toggle = e.target.closest('#archiveToggle');
@@ -1475,8 +1823,39 @@ document.addEventListener('input', async (e) => {
   }
 });
 
+document.getElementById('favoriteForm')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+
+  const id = document.getElementById('favoriteFormId')?.value || '';
+  const name = document.getElementById('favoriteFormName')?.value || '';
+  const url = document.getElementById('favoriteFormUrl')?.value || '';
+
+  try {
+    const mode = favoriteModalMode;
+    await upsertFavorite({
+      id: mode === 'edit' ? id : '',
+      name,
+      url,
+      faviconUrl: buildFallbackFaviconUrl(url),
+    });
+
+    closeFavoriteModal();
+    await renderFavoritesSection();
+    showToast(mode === 'edit' ? 'Favorite updated' : 'Favorite added');
+  } catch (err) {
+    console.warn('[tab-out] Failed to save favorite:', err);
+    showToast('Enter a valid http/https URL');
+  }
+});
+
 
 /* ----------------------------------------------------------------
    INITIALIZE
    ---------------------------------------------------------------- */
-renderDashboard();
+async function initApp() {
+  // 中文注释：先恢复主题，再渲染页面，避免初次渲染后再跳色。
+  await loadThemePreference();
+  await renderDashboard();
+}
+
+initApp();
